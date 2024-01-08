@@ -1,0 +1,621 @@
+from time import sleep
+from spike import PrimeHub, ColorSensor, Motor, MotorPair
+from spike.control import Timer
+from hub import button
+
+from math import *
+
+phub = PrimeHub()
+# Ports
+wheels = MotorPair('E', 'F')
+colorA = ColorSensor('A')
+colorB = ColorSensor('B')
+motorC = Motor('C')
+motorD = Motor('D')
+# Variables
+target_light = 58
+timer = Timer()
+KP = 0.25
+adaptive = 1
+LEFT = 1
+RIGHT = 2
+CENTER = 3
+FORWARD = 1
+BACKWARD = 2
+DEFAULT_SPEED = 40
+DEFAULT_TURN_SPEED = 30
+
+####################################
+# Configuration for Sorting Center #
+# Select using RIGHT button click  #
+#       Default: CONFIG = 1        #
+#                                  #
+########### [CONFIG = 1] ###########
+#                                  #
+#            → → → B ‖             #
+#            . | Y | ‖             #
+#            → G | | ‖             #
+#                                  #
+########### [CONFIG = 2] ###########
+#                                  #
+#            → → → B ‖             #
+#            → G | | ‖             #
+#            . | Y | ‖             #
+#                                  #
+########### [CONFIG = 3] ###########
+#                                  #
+#            . | Y | ‖             #
+#            → → → B ‖             #
+#            → G | | ‖             #
+#                                  #
+####################################
+
+CONFIG = 1
+
+####################################
+#                                  #
+# Set on LEFT button click         #
+#                                  #
+####################################
+START_MATCH = False
+STRAIGHT_LAUNCH = True
+
+
+# Functions
+
+def get_line_correction(reflected_light, sign):
+    '''
+    Get correction value for line following based on color
+    '''
+    global integral, last_error
+    error = reflected_light - target_light
+    derivative = error - last_error
+    integral = integral + error
+    last_error = error
+    if adaptive:
+        correction = ((KP * error) + (derivative * 1) + (integral * 0.001)) * sign
+    else:
+        correction = KP * error * sign
+    return correction
+
+def is_color_black(sensor):
+    '''
+    Check if sensor detects black
+    '''
+    return sensor.get_reflected_light() < 20 and sensor.get_color() == 'black'
+
+def is_color_white(sensor):
+    '''
+    Check if sensor detects white
+    '''
+    return sensor.get_reflected_light() > 95 and sensor.get_color() == 'white'
+
+def get_line_follow_parameters(port, align, color):
+    '''
+    Set sign (motor direction), sensors for line following and color check
+    '''
+    if align == RIGHT:
+        sign = -1
+    else:
+        sign = 1
+    if port == 'A':
+        line_sensor = colorA
+        stop_sensor = colorB
+    elif port == 'B':
+        line_sensor = colorB
+        stop_sensor = colorA
+    if color == 'black':
+        stop_func = is_color_black
+    else:
+        stop_func = is_color_white
+    return sign, line_sensor, stop_sensor, stop_func
+
+def line_follow_till_color(port, align, speed, color):
+    '''
+    Follow line using port, till other color sensor matches black or white
+    '''
+    global integral, last_error
+    integral, last_error = 0, 0
+    sign, line_sensor, stop_sensor, stop_func = get_line_follow_parameters(port, align, color)
+    while not stop_func(stop_sensor):
+        correction = get_line_correction(line_sensor.get_reflected_light(), sign)
+        wheels.start_tank_at_power(speed + int(correction), speed - int(correction))
+    wheels.stop()
+
+def line_follow_out_of_color(port, align, speed, color):
+    '''
+    Follow line using port, till other color sensor moves out of black or white
+    '''
+    global integral, last_error
+    integral, last_error = 0, 0
+    sign, line_sensor, stop_sensor, stop_func = get_line_follow_parameters(port, align, color)
+    while stop_func(stop_sensor):
+        correction = get_line_correction(line_sensor.get_reflected_light(), sign)
+        wheels.start_tank_at_power(speed + int(correction), speed - int(correction))
+    wheels.stop()
+
+def line_follow_timer(port, align, speed, duration):
+    '''
+    Follow line using port, for duration (seconds)
+    '''
+    global integral, last_error, timer
+    integral, last_error = 0, 0
+    sign, line_sensor, stop_sensor, stop_func = get_line_follow_parameters(port, align, None)
+    timer.reset()
+    while timer.now() < duration:
+        correction = get_line_correction(line_sensor.get_reflected_light(), sign)
+        wheels.start_tank_at_power(speed + int(correction), speed - int(correction))
+    wheels.stop()
+
+def drive_distance_cm(distance, direction, speed = DEFAULT_SPEED):
+    '''
+    Drive distance in cm using move_tank
+    '''
+    if direction != FORWARD:
+        speed *= -1
+    wheels.move_tank(distance, 'cm', speed, speed)
+
+# Drive forward till sensor detects black or white color
+def drive_till_color(port, speed, color):
+    '''
+    Drive distance cm but instead of stopping at distance, stops at color
+    '''
+    if port == 'B':
+        stop_sensor = colorB
+    elif port == 'A':
+        stop_sensor = colorA
+    if color == 'black':
+        stop_func = is_color_black
+    else:
+        stop_func = is_color_white
+    wheels.start_tank_at_power(speed, speed)
+    while not stop_func(stop_sensor):
+        pass
+    wheels.stop()
+
+def get_motor_speeds_for_turn(pivot_point, side, speed):
+    '''
+    Alters motor speed depending on what direction we are turning
+    '''
+    if pivot_point == LEFT:
+        left_speed = 0
+    else:
+        left_speed = speed
+    if pivot_point == RIGHT:
+        right_speed = 0
+    else:
+        right_speed = -speed
+    if side == LEFT:
+        left_speed *= -1
+        right_speed *= -1
+    return left_speed, right_speed
+
+def gyro_turn(degrees, pivot_point, side, speed = DEFAULT_TURN_SPEED):
+    '''
+    Turn using gyro to given angle
+    '''
+    left_speed, right_speed = get_motor_speeds_for_turn(pivot_point, side, speed)
+    phub.motion_sensor.reset_yaw_angle()
+    yaw = 0
+    while yaw < degrees:
+        # scale = max(0.4, (degrees-yaw)/degrees)
+        scale = max(1, (degrees-yaw)/degrees)
+        wheels.start_tank_at_power(int(left_speed*scale), int(right_speed*scale))
+        yaw = abs(phub.motion_sensor.get_yaw_angle())
+    wheels.stop()
+
+def gyro_turn_till_color(pivot_point, side, speed, port, color):
+    '''
+    Turn until sensor detects black or white color
+    '''
+    left_speed, right_speed = get_motor_speeds_for_turn(pivot_point, side, speed)
+    phub.motion_sensor.reset_yaw_angle()
+    if color == 'black':
+        stop_func = is_color_black
+    else:
+        stop_func = is_color_white
+    if port == 'A':
+        stop_sensor = colorA
+    elif port == 'B':
+        stop_sensor = colorB
+    while not stop_func(stop_sensor):
+        wheels.start_tank_at_power(left_speed, right_speed)
+    wheels.stop()
+
+def gyro_move(duration, speed, direction):
+    '''
+    Move straight using gyro for correction
+    '''
+    if direction == FORWARD:
+        power = speed
+        sign = 16
+    elif direction == BACKWARD:
+        power = -speed
+        sign = -16
+    timer.reset()
+    phub.motion_sensor.reset_yaw_angle()
+    while timer.now() < duration:
+        correction = sign * (power * (phub.motion_sensor.get_yaw_angle() / 180))
+        wheels.start_tank_at_power(power - int(correction), power + int(correction))
+    wheels.stop()
+
+def open_arm(degrees, speed = DEFAULT_SPEED):
+    '''
+    Open arm connected to motor C
+    '''
+    motorC.run_for_degrees(degrees, speed)
+
+def close_arm(degrees=None, speed = DEFAULT_SPEED):
+    '''
+    Close arm connected to motor C
+    '''
+    if not degrees:
+        degrees = motorC.get_degrees_counted()
+    motorC.run_for_degrees(degrees, -speed)
+
+def forklift_down(degrees, speed = DEFAULT_SPEED):
+    '''
+    Open forklift connceted to motor D
+    '''
+    motorD.run_for_degrees(degrees, speed)
+
+def forklift_up(degrees=None, speed = DEFAULT_SPEED):
+    '''
+    Close forklift connceted to motor D
+    '''
+    if not degrees:
+        degrees = motorD.get_degrees_counted()
+    motorD.run_for_degrees(degrees, -speed)
+
+# Missions
+
+def launch_from_base():
+    '''
+    Start from home and follow line till first black marker
+    '''
+    drive_distance_cm(10, FORWARD)
+    line_follow_till_color('B', RIGHT, 30, 'black')
+
+def truck_and_fold_bridge_straight_launch():
+    open_arm(90)
+    drive_distance_cm(68, FORWARD, 50)
+    close_arm(90)
+    drive_distance_cm(31, FORWARD, 50)
+    open_arm(175)
+    drive_distance_cm(15, FORWARD, 50)
+    close_arm()
+    gyro_turn(80, RIGHT, RIGHT)
+    drive_till_color('A', 35, 'black')
+    drive_distance_cm(2, FORWARD)
+    gyro_turn_till_color(LEFT, LEFT, DEFAULT_TURN_SPEED, 'B', 'black')
+
+
+def truck_and_fold_bridge():
+    '''
+    Pushes truck to bridge and and knocks over bridge
+    '''
+    gyro_turn(46, RIGHT, RIGHT)
+    drive_distance_cm(24, FORWARD)
+    drive_distance_cm(9, BACKWARD)
+    gyro_turn(45, RIGHT, RIGHT)
+    drive_distance_cm(19, FORWARD)
+    gyro_turn(44, RIGHT, LEFT)
+    drive_distance_cm(33, FORWARD)
+    open_arm(175, 30)
+    drive_distance_cm(13, FORWARD)
+    close_arm()
+    gyro_turn(80, RIGHT, RIGHT)
+    drive_till_color('A', 35, 'black')
+    drive_distance_cm(2, FORWARD)
+    gyro_turn_till_color(LEFT, LEFT, DEFAULT_TURN_SPEED, 'B', 'black')
+
+def deliver_package():
+    '''
+    Deliver Amazon package
+    '''
+    line_follow_till_color('B', RIGHT, 30, 'black')
+    gyro_turn(5, RIGHT, RIGHT)
+    drive_distance_cm(12, FORWARD, 30)
+    forklift_down(180, 25)
+    forklift_up(180)
+    drive_distance_cm(19, BACKWARD, 40)
+    gyro_turn(95, LEFT, LEFT)
+    drive_distance_cm(14, FORWARD, 40)
+    gyro_turn(80, RIGHT, RIGHT)
+    drive_till_color('A', 30, 'black')
+    drive_till_color('A', 30, 'white')
+
+def blue_crate_in_circle():
+    '''
+    Deliver Blue Crate in Blue Circle
+    '''
+    line_follow_till_color('B', LEFT, 40, 'black')
+    gyro_turn(35, LEFT, LEFT)
+    drive_distance_cm(4, FORWARD, 25)
+    forklift_down(171, 20)
+    sleep(1)
+    drive_distance_cm(2, BACKWARD, 25)
+    forklift_up()
+    gyro_turn(55, LEFT, LEFT)
+
+def train_track_repair():
+    '''
+    Pull down train track
+    '''
+    open_arm(135, 40)
+    line_follow_till_color('B', LEFT, 30, 'black')
+    line_follow_out_of_color('B', LEFT, 30, 'black')
+    line_follow_till_color('B', LEFT, 30, 'black')
+    drive_distance_cm(23, FORWARD, 40)
+    open_arm(40, 40)
+    drive_distance_cm(16, BACKWARD, 40)
+    close_arm()
+    gyro_turn(75, LEFT, LEFT)
+
+def helicopter_nudge():
+    '''
+    Pushes lever on helicopter to drop package
+    '''
+    line_follow_till_color('B', LEFT, 35, 'black')
+    drive_distance_cm(11, FORWARD, 25)
+    gyro_turn(46, CENTER, RIGHT)
+    drive_distance_cm(3, FORWARD, 25)
+    drive_distance_cm(7, BACKWARD, 25)
+    gyro_turn(100, CENTER, RIGHT)
+
+def train_push_blue_crate_pickup():
+    '''
+    1. Push the train to locking position
+    2. Pick up blue crate
+    '''
+    open_arm(90)
+    line_follow_timer('A', RIGHT, 30, 2)
+    line_follow_till_color('A', RIGHT, 35, 'white')
+    close_arm(15)
+    open_arm(50, 60)
+    close_arm(120)
+    # Pick up Blue Crate
+    if CONFIG in [1, 2]:
+        # Blue Crate in 1st slot
+        phub.motion_sensor.reset_yaw_angle()
+        line_follow_till_color('A', RIGHT, 30, 'black')
+        drive_distance_cm(4, BACKWARD, 15)
+        yaw = phub.motion_sensor.get_yaw_angle()
+        print(yaw)
+        gyro_turn(yaw, LEFT, LEFT, 20)
+        forklift_down(172, 10)
+        drive_distance_cm(6, FORWARD, 15)
+        forklift_up(172, 10)
+        drive_distance_cm(9, BACKWARD, 20)
+        gyro_turn(120, CENTER, RIGHT)
+        gyro_turn_till_color(CENTER, RIGHT, 20, 'B', 'white')
+    else:
+        # Blue Crate in 2nd slot
+        line_follow_till_color('A', RIGHT, 30, 'black')
+        gyro_turn(80, LEFT, RIGHT, 20)
+        drive_till_color('A', 20, 'black')
+        drive_till_color('A', 20, 'white')
+        drive_till_color('A', 20, 'black')
+        gyro_turn(85, LEFT, LEFT, 20)
+        drive_distance_cm(4, BACKWARD, 20)
+        forklift_down(174, 10)
+        drive_distance_cm(8, FORWARD, 20)
+        forklift_up(174, 10)
+        drive_distance_cm(13, BACKWARD, 20)
+        gyro_turn(145, LEFT, LEFT)
+        drive_till_color('B', 30, 'black')
+
+def green_crate_pickup():
+    '''
+    Pick-up Green Crate from sorting area
+    '''
+    gyro_turn(44, LEFT, LEFT)
+    drive_distance_cm(8, FORWARD)
+    drive_till_color('A', 30, 'black')
+    # gyro_turn(32, LEFT, LEFT, 20)
+    gyro_turn_till_color(LEFT, LEFT, DEFAULT_TURN_SPEED, 'B', 'black')
+    line_follow_till_color('B', LEFT, 20, 'white')
+    if CONFIG in [1, 3]:
+        # Green Crate in 3rd slot
+        gyro_turn(2, RIGHT, RIGHT, 15)
+        forklift_down(174, 10)
+        drive_distance_cm(6, FORWARD, 10)
+        forklift_up(174, 10)
+        drive_distance_cm(35, BACKWARD)
+    elif CONFIG == 2:
+        # Green Crate in 2nd slot
+        gyro_turn(90, LEFT, LEFT, 20)
+        drive_distance_cm(2, FORWARD, 20)
+        gyro_turn(92, RIGHT, RIGHT, 20)
+        drive_distance_cm(8, BACKWARD, 20)
+        forklift_down(175, 10)
+        drive_distance_cm(6, FORWARD, 15)
+        forklift_up(175, 10)
+        drive_distance_cm(40, BACKWARD)
+    gyro_turn_till_color(RIGHT, RIGHT, DEFAULT_TURN_SPEED, 'A', 'black')
+
+
+def cargo_ship_sail():
+    '''
+    Push the Cargo Ship from the deck
+    '''
+    line_follow_till_color('A', LEFT, 40, 'black')
+    drive_distance_cm(2, BACKWARD, 25)
+    gyro_turn(95, RIGHT, RIGHT,)
+    forklift_down(142, 15)
+    drive_distance_cm(9, FORWARD, 40)
+    # Both motors and high speed turn required to push the ship
+    gyro_turn(45, CENTER, RIGHT, 40)
+    drive_distance_cm(3, BACKWARD, 30)
+    forklift_up(142, 15)
+    gyro_turn(phub.motion_sensor.get_yaw_angle() + 90, LEFT, LEFT)
+    drive_till_color('A', 40, 'black')
+    gyro_turn(60, LEFT, LEFT)
+    gyro_turn_till_color(LEFT, LEFT, DEFAULT_TURN_SPEED, 'B', 'black')
+    line_follow_till_color('B', RIGHT, 30, 'black')
+    gyro_turn(60, RIGHT, RIGHT)
+
+def load_cargo_ship():
+    '''
+    1. Drive from home to cargo ship
+    2. Load 2 grey crates on cargo ship
+    '''
+    line_follow_out_of_color('B', RIGHT, 35, 'black')
+    line_follow_till_color('B', RIGHT, 35, 'black')
+    gyro_turn(10, LEFT, LEFT, 40)
+    gyro_turn_till_color(LEFT, LEFT, 40, 'B', 'black')
+    gyro_turn(5, LEFT, LEFT, 40)
+    line_follow_timer('B', LEFT, 25, 1)
+    drive_till_color('B', 30, 'white')
+    line_follow_till_color('B', LEFT, 25, 'white')
+    drive_distance_cm(20, FORWARD, 30)
+    gyro_turn(60, RIGHT, RIGHT, 15)
+    drive_distance_cm(1, FORWARD, 15)
+    forklift_down(159, 8)
+    drive_distance_cm(10, BACKWARD, 10)
+    forklift_up()
+
+def accident_avoidence():
+    '''
+    Knocks over 1st layer and stops
+    '''
+    gyro_turn(145, LEFT, LEFT)
+    forklift_down(125, 8)
+    drive_distance_cm(4, FORWARD, 20)
+    forklift_up()
+    drive_distance_cm(6, FORWARD, 30)
+
+def plane_cargo():
+    '''
+    1. Push blue cargo out
+    2. Deliver green crate in green circle
+    3. Switch the engine on
+    4. Open cargo plane
+    5. Go to home area
+    '''
+    line_follow_till_color('A', LEFT, 35, 'black')
+    line_follow_out_of_color('A', LEFT, 30, 'black')
+    # Unused capacity: push blue cargo out of the mat
+    gyro_turn(50, RIGHT, RIGHT)
+    drive_till_color('B', 30, 'black')
+    drive_distance_cm(18, FORWARD)
+    gyro_turn_till_color(LEFT, RIGHT, DEFAULT_TURN_SPEED, 'B', 'black')
+    # Deliver green crate
+    line_follow_till_color('B', RIGHT, 30, 'black')
+    gyro_turn(5, LEFT, LEFT)
+    forklift_down(171, 20)
+    sleep(1)
+    forklift_up(20, 15)
+    gyro_turn(7, LEFT, RIGHT)
+    # Switch Engine
+    drive_distance_cm(10, FORWARD, 30)
+    forklift_down(30, 15)
+    drive_distance_cm(5, FORWARD, 30)
+    forklift_up(30)
+    forklift_down(40)
+    drive_distance_cm(3, BACKWARD, 30)
+    forklift_up()
+    # Drive back towards plane
+    drive_distance_cm(17, BACKWARD, 30)
+    gyro_turn(80, RIGHT, LEFT)
+    drive_distance_cm(8, FORWARD, 30)
+    forklift_down(190, 10)
+    drive_distance_cm(11, BACKWARD)
+    forklift_up()
+    # Drive back to home area
+    gyro_turn(90, LEFT, LEFT)
+    drive_distance_cm(45, FORWARD)
+    gyro_turn(90, CENTER, LEFT)
+
+def run_1():
+    '''
+    Missions Covered:
+    1. Truck Push
+    2. Fold Bridge
+    3. Deliver Amazon Package
+    4. Train Track Repair
+    5. Train Push
+    6. Blue & Green crate pickup, delivery to same color circles
+    7. Cargo Ship Sail
+    8. Switch Engine on
+    9. Push Blue Cargo (Excess Capacity) out
+    10. Cargo Plane open
+    '''
+    if STRAIGHT_LAUNCH:
+        truck_and_fold_bridge_straight_launch()
+    else:
+        launch_from_base()
+        truck_and_fold_bridge()
+    deliver_package()
+    train_track_repair()
+    helicopter_nudge()
+    train_push_blue_crate_pickup()
+    blue_crate_in_circle()
+    green_crate_pickup()
+    cargo_ship_sail()
+    plane_cargo()
+
+def run_4():
+    '''
+    Missions Covered:
+    1. Deliver (2) Grey crates to Cargo Ship
+    2. Parking / Accident Avoidance
+    '''
+    launch_from_base()
+    load_cargo_ship()
+    accident_avoidence()
+
+def full_match():
+    button.left.callback(None)
+    button.right.callback(None)
+    run_1()
+    sleep(6)
+    run_4()
+
+# Called on RIGHT button click
+def on_right_button(pressed_ms):
+    global CONFIG
+    if pressed_ms:
+        CONFIG += 1
+        if CONFIG == 4:
+            CONFIG = 1
+        phub.light_matrix.write('C')
+        phub.light_matrix.write(str(CONFIG))
+
+# Called on LEFT button click
+def on_left_button(pressed_ms):
+    global START_MATCH
+    if pressed_ms:
+        if not START_MATCH:
+            START_MATCH = True
+        else:
+            # Exit if on second click
+            raise SystemExit
+
+# Called on program start
+def on_start():
+    button.left.callback(on_left_button)
+    button.right.callback(on_right_button)
+    motorC.set_default_speed(DEFAULT_SPEED)
+    motorD.set_default_speed(DEFAULT_SPEED)
+    wheels.set_default_speed(DEFAULT_SPEED)
+    motorC.set_stop_action('hold')
+    motorD.set_stop_action('hold')
+    motorC.stop()
+    motorD.stop()
+    wheels.stop()
+    wheels.set_stop_action('brake')
+    motorC.set_degrees_counted(0)
+    motorD.set_degrees_counted(0)
+    on_right_button(100)
+
+# Main Program
+on_start()
+wait = 0
+while wait < 180:
+    if START_MATCH:
+        full_match()
+        break
+    sleep(1)
+    wait += 1
+raise SystemExit
